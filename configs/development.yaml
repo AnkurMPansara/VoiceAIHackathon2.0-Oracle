@@ -1,0 +1,86 @@
+# Best Time to Call — Development Configuration
+# SRS §14 (CFG-01): All settings validated on startup with content hash.
+# Secrets are environment-injected, not committed.
+
+# Runtime mode: "shadow" (compute/log only) or "live" (submit to scheduler)
+runtime_mode: shadow
+
+# Business timezone for all calculations
+timezone: Asia/Kolkata
+
+# Business calendar: Mon-Sat, 08:00-18:00, no holidays (development)
+calendar:
+  days_of_week: [0, 1, 2, 3, 4, 5]  # 0=Monday, 6=Sunday
+  start_hour: 8
+  end_hour: 18  # exclusive; 18:00 is NOT permitted
+  holidays: []
+
+# Lead and scheduling constraints
+initial_delay_maximum_minutes: 15
+expiry_when_upstream_absent: null
+max_calls_per_seller_per_day: 3
+max_attempts_per_lead: 5
+minimum_inter_call_gap_minutes: 15
+dispatch_lead_time_seconds: 5
+decision_execution_tolerance_minutes: 5
+cache_staleness_seconds: 5
+
+# Experiment configuration (disabled by default)
+experiment_enabled: false
+double_call_enabled: false
+
+# Terminal retry dispositions (produce no automatic retry)
+terminal_retry_dispositions:
+  - Meeting Fixed
+  - Not Interested
+  - General
+
+# Retention and replay horizon (development)
+retention_horizon_days: 90
+
+# Model configuration
+model_config:
+  k: 4  # Fourier basis pairs; candidates: 2, 3, 4
+  gamma: 1.0  # MUST be 1.0 in release 1; no discounting
+  lambda_smooth: 1.0  # Smoothness penalty coefficient
+  lambda_parent: 10.0  # Parent regularization coefficient
+  alpha: 0.1  # Prior covariance scaling (TRAIN-03)
+  segment_min_attempts: 2000  # Minimum attempts for segment eligibility (TRAIN-01)
+  segment_min_sellers: 200  # Minimum distinct sellers for segment eligibility
+  support_bin_min_attempts: 50  # Minimum attempts per 15-min bin (TRAIN-05)
+  support_bin_min_sellers: 30  # Minimum distinct sellers per 15-min bin
+  state_history_start: "2026-04-01"  # Start of state history interval
+  state_history_end: "2026-10-01"  # End of state history interval
+
+# Reward configuration (MOD-01)
+reward_config:
+  w_meeting: 1.0
+  w_answered: 0.1
+  c_dial: 0.02
+  w_not_interested: 0.0
+  sigma2: 1.0  # Working noise variance; floored at 1e-4 (TRAIN-04)
+
+# Database configuration
+database:
+  dsn: "postgresql://btc:btc_dev@localhost:5432/btc_dev"
+  pool_size: 10
+  timeout: 30
+
+# Redis cache (optional)
+redis:
+  enabled: false
+  dsn: "redis://localhost:6379/0"
+  key_prefix: "btc:"
+
+# Authentication (development: hardcoded token; production: environment-injected)
+auth:
+  mode: bearer
+  token: "dev-token-change-me"  # IN production: use env var BTC_AUTH_TOKEN
+
+# Benchmark targets (NFR-05)
+benchmarks:
+  target_recommend_rps: 500
+  target_outcome_rps: 100
+  total_sellers: 150000
+  cold_read_fraction: 0.1
+  hot_seller_fraction: 0.1
