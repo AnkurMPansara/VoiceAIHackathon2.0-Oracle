@@ -479,13 +479,19 @@ class TestStructuredOutput:
             "missing_rate": 0.05,
         })
 
-        with patch("btc.evaluation.phase0.generate_phase0_report", mock_func):
-            rc = main([
-                "phase0-report",
-                "--config", config_path,
-                "--attempts-csv", "a.csv",
-                "--sellers-csv", "s.csv",
-            ])
+        with patch("btc.data.adapters.load_attempts_csv") as mock_load_attempts:
+            mock_load_attempts.return_value = ([], {})
+            with patch("btc.data.adapters.load_sellers_csv") as mock_load_sellers:
+                mock_load_sellers.return_value = {}
+                with patch("btc.data.adapters.join_attempts_sellers") as mock_join:
+                    mock_join.return_value = []
+                    with patch("btc.evaluation.phase0.generate_phase0_report", mock_func):
+                        rc = main([
+                            "phase0-report",
+                            "--config", config_path,
+                            "--attempts-csv", "a.csv",
+                            "--sellers-csv", "s.csv",
+                        ])
 
         assert rc == 0
         captured = sys.stdout

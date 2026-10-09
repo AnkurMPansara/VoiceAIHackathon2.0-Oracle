@@ -52,7 +52,11 @@ def _compute_sha256(path: str) -> str:
 
 
 def _load_checksums(bundle_dir: str) -> Dict[str, str]:
-    """Load expected checksums from checksums.txt."""
+    """Load expected checksums from checksums.txt.
+
+    Expected format: ``<sha256>  <filename>`` (hash first, two spaces, then filename).
+    Returns ``{filename: expected_sha256}``.
+    """
     path = _checksums_path(bundle_dir)
     if not os.path.exists(path):
         return {}
@@ -64,7 +68,7 @@ def _load_checksums(bundle_dir: str) -> Dict[str, str]:
                 continue
             parts = line.split(None, 1)
             if len(parts) == 2:
-                checksums[parts[0]] = parts[1]
+                checksums[parts[1]] = parts[0]
     return checksums
 
 
@@ -123,6 +127,7 @@ def validate_bundle(bundle_path: str, verbose: bool = False) -> Dict[str, Any]:
     errors: List[str] = []
     warnings: List[str] = []
     details: Dict[str, Any] = {} if verbose else {}
+    metadata: Dict[str, Any] = {}
 
     # 1. Directory exists
     if not os.path.isdir(bundle_path):

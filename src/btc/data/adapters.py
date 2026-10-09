@@ -40,9 +40,12 @@ _DISPOSITION_MAP: dict[str, str] = {
     "NotAnswered": "NOT_ANSWERED",
     "Meeting Fixed": "MEETING_FIXED",
     "Meeting_Fixed": "MEETING_FIXED",
+    "MEETING_FIXED": "MEETING_FIXED",
     "Not Interested": "NOT_INTERESTED",
     "Not_Interested": "NOT_INTERESTED",
+    "NOT_INTERESTED": "NOT_INTERESTED",
     "General": "GENERAL",
+    "GENERAL": "GENERAL",
     "General (talked)": "GENERAL",
     "General (talked) (call back)": "CALL_LATER_BUSY",
     "Not Interested (talked)": "NOT_INTERESTED",
@@ -52,6 +55,7 @@ _DISPOSITION_MAP: dict[str, str] = {
     "Call_Later": "CALL_LATER_BUSY",
     "Busy": "CALL_LATER_BUSY",
     "Not Available": "CALL_LATER_BUSY",
+    "CALL_LATER_BUSY": "CALL_LATER_BUSY",
     "Wrong Number": "UNKNOWN",
     "Invalid Number": "UNKNOWN",
     "Number Closed": "UNKNOWN",
@@ -65,6 +69,7 @@ _DISPOSITION_MAP: dict[str, str] = {
     "Call Next Week": "CALL_LATER_BUSY",
     "Call Next Month": "CALL_LATER_BUSY",
     "Call Next Year": "CALL_LATER_BUSY",
+    "NOT_ANSWERED": "NOT_ANSWERED",
     "Call After 5": "CALL_LATER_BUSY",
     "Call After 6": "CALL_LATER_BUSY",
     "Call After 7": "CALL_LATER_BUSY",
@@ -446,6 +451,11 @@ def load_attempts_csv(
             lead_sent_time = parse_timestamp(row.get("lead_sent_time", ""), source_tz)
             call_start_time = parse_timestamp(row.get("call_start_time", ""), source_tz)
 
+            # finalized_at: when the outcome became available (vendor_response_time or call_start_time)
+            finalized_at = parse_timestamp(row.get("vendor_response_time", ""), source_tz)
+            if finalized_at is None:
+                finalized_at = call_start_time
+
             # lead_tbro_time (nullable callback request).
             raw_callback = row.get("lead_tbro_time", "")
             requested_callback_at: Optional[datetime] = None
@@ -498,6 +508,7 @@ def load_attempts_csv(
                 "attempt_number": attempt_number,
                 "lead_sent_time": lead_sent_time,
                 "call_start_time": call_start_time,
+                "finalized_at": finalized_at,
                 "answered": answered,
                 "disposition": disposition,
                 "meeting_fixed": meeting_fixed,

@@ -169,7 +169,18 @@ def normalize_outcome(raw: dict, sellers: dict) -> dict:
 
     # Step 2: Map lead_call_status → answered boolean
     lead_call_status = raw.get("lead_call_status") or raw.get("call_status")
-    answered = map_answered(lead_call_status)
+    if "answered" in raw:
+        answered_raw = raw["answered"]
+        if isinstance(answered_raw, bool):
+            answered = answered_raw
+        elif isinstance(answered_raw, (int, float)):
+            answered = bool(answered_raw)
+        elif isinstance(answered_raw, str):
+            answered = map_answered(answered_raw)
+        else:
+            answered = map_answered(lead_call_status)
+    else:
+        answered = map_answered(lead_call_status)
 
     # Step 3: Convert timestamps to timezone-aware UTC
     finalized_at = raw.get("finalized_at")

@@ -193,13 +193,27 @@ def _handle_phase0_report(args: argparse.Namespace) -> Dict[str, Any]:
 
     try:
         # Import the evaluation module function (WP6 – Evaluation/QA agent)
+        from btc.data.adapters import (
+            load_attempts_csv,
+            load_sellers_csv,
+            join_attempts_sellers,
+        )
         from btc.evaluation.phase0 import generate_phase0_report  # type: ignore[import-not-found]
 
-        result = generate_phase0_report(
-            config=config,
-            attempts_csv=args.attempts_csv,
-            sellers_csv=args.sellers_csv,
+        # Load and normalize data
+        raw_attempts, import_report = load_attempts_csv(
+            args.attempts_csv, source_tz=config.timezone
         )
+        sellers = load_sellers_csv(args.sellers_csv)
+        normalized_data = join_attempts_sellers(raw_attempts, sellers)
+
+        result = generate_phase0_report(
+            normalized_data=normalized_data,
+            sellers=sellers,
+            config=config.model,
+        )
+
+        result["import_report"] = import_report
 
         if args.output:
             Path(args.output).write_text(

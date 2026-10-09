@@ -1,0 +1,2 @@
+[console_scripts]
+btc = btc.cli:main

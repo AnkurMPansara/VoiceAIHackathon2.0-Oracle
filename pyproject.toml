@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=69.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "best-time-to-call"
@@ -40,5 +40,5 @@ python_functions = ["test_*"]
 addopts = "-v --tb=short"
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]
 include = ["btc*"]

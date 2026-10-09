@@ -143,6 +143,7 @@ class PriorBundle:
     bundle_id: str = ""
     compatibility_id: str = ""
     version: str = "1.0.0"
+    format_version: int = 1
     created_at: str = ""
     k: int = 4
     d: int = 0
@@ -151,8 +152,11 @@ class PriorBundle:
     state_history_start: str = ""
     state_history_end: str = ""
     normalization: dict = field(default_factory=dict)
+    feature_ordering: list[str] = field(default_factory=lambda: ["intercept"] + [f"sin_{i}" for i in range(1, 5)] + [f"cos_{i}" for i in range(1, 5)])
     segment_keys: list[str] = field(default_factory=list)
     global_mu0: npt.NDArray[np.float64] = None  # type: ignore[assignment]
+    global_mean: npt.NDArray[np.float64] = None  # type: ignore[assignment]
+    prior_alpha: float = 0.1
     global_sigma0: npt.NDArray[np.float64] = None  # type: ignore[assignment]
     global_lambda0: npt.NDArray[np.float64] = None  # type: ignore[assignment]
     global_eta0: npt.NDArray[np.float64] = None  # type: ignore[assignment]
@@ -204,6 +208,7 @@ class PriorBundle:
             "bundle_id": self.bundle_id,
             "compatibility_id": self.compatibility_id,
             "version": self.version,
+            "format_version": self.format_version,
             "created_at": self.created_at,
             "k": self.k,
             "d": self.d,
@@ -212,6 +217,9 @@ class PriorBundle:
             "state_history_start": self.state_history_start,
             "state_history_end": self.state_history_end,
             "normalization": self.normalization,
+            "feature_ordering": self.feature_ordering,
+            "global_mean": self.global_mean.tolist() if self.global_mean is not None else [],
+            "prior_alpha": self.prior_alpha,
             "segment_keys": self.segment_keys,
             "segment_parent_keys": self.segment_parent_keys,
             "segment_hierarchy": self.segment_hierarchy,
@@ -243,6 +251,7 @@ class PriorBundle:
             bundle_id=metadata.get("bundle_id", ""),
             compatibility_id=metadata.get("compatibility_id", ""),
             version=metadata.get("version", "1.0.0"),
+            format_version=metadata.get("format_version", 1),
             created_at=metadata.get("created_at", ""),
             k=metadata.get("k", 4),
             d=metadata.get("d", 0),
@@ -251,6 +260,9 @@ class PriorBundle:
             state_history_start=metadata.get("state_history_start", ""),
             state_history_end=metadata.get("state_history_end", ""),
             normalization=metadata.get("normalization", {}),
+            feature_ordering=metadata.get("feature_ordering", ["intercept"] + [f"sin_{i}" for i in range(1, 5)] + [f"cos_{i}" for i in range(1, 5)]),
+            global_mean=np.array(metadata.get("global_mean", []), dtype=np.float64) if metadata.get("global_mean") else None,
+            prior_alpha=metadata.get("prior_alpha", 0.1),
             segment_keys=metadata.get("segment_keys", []),
             segment_parent_keys=metadata.get("segment_parent_keys", []),
             segment_hierarchy=metadata.get("segment_hierarchy", {}),
@@ -700,15 +712,15 @@ def save_bundle(bundle: PriorBundle, output_dir: str) -> str:
         np.savez_compressed(arrays_path)  # Empty NPZ
 
     # Compute checksums
-    checksums: list[str] = []
+    checksum_lines: list[str] = []
     for filename in ["metadata.json", "arrays.npz"]:
         filepath = os.path.join(output_dir, filename)
         sha256 = _compute_file_sha256(filepath)
-        checksums.append(f"{filename}:{sha256}")
+        checksum_lines.append(f"{sha256}  {filename}")
 
     checksums_path = os.path.join(output_dir, "checksums.txt")
     with open(checksums_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(checksums) + "\n")
+        f.write("\n".join(checksum_lines) + "\n")
 
     logger.info("Bundle saved to %s (id=%s)", output_dir, bundle.bundle_id)
     return output_dir
@@ -1099,15 +1111,16 @@ def check_compatibility(
 
 def run_training_pipeline(
     data_dir: str,
-    config_path: str,
-    output_dir: str,
+    config_path: Optional[str] = None,
+    output_dir: str = "",
     dry_run: bool = False,
+    config: Optional[Config] = None,
 ) -> dict:
     """Full training pipeline for the Best Time to Call model.
 
     Implements the complete training workflow:
 
-    1. Load config from YAML
+    1. Load config from YAML (or use provided config object)
     2. Load CSV data via btc.data.adapters
     3. Normalize via btc.data.normalization
     4. Create chronological splits (TRAIN-06)
@@ -1126,12 +1139,17 @@ def run_training_pipeline(
         Expected files:
         - Best-Time-to-Call - Call Attempts *.csv
         - Best-Time-to-Call - Sellers.csv
-    config_path : str
+    config_path : str, optional
         Path to YAML configuration file.
+        If both ``config_path`` and ``config`` are provided, ``config`` takes
+        precedence.
     output_dir : str
         Directory to save the trained bundle.
     dry_run : bool
         If True, run all steps except saving the bundle.
+    config : Config, optional
+        Pre-loaded Config object. If provided, ``config_path`` is ignored.
+        This allows training without reading a YAML file.
 
     Returns
     -------
@@ -1157,25 +1175,40 @@ def run_training_pipeline(
 
     Examples
     --------
+    >>> # From config file
     >>> report = run_training_pipeline(
     ...     data_dir="data",
     ...     config_path="config.yaml",
     ...     output_dir="bundles",
     ... )
-    >>> "bundle_id" in report
-    True
+
+    >>> # From Config object (no YAML file needed)
+    >>> from btc.config import default_config
+    >>> report = run_training_pipeline(
+    ...     data_dir="data",
+    ...     config=default_config(),
+    ...     output_dir="bundles",
+    ... )
     """
     logger.info("Starting training pipeline")
-    logger.info("  data_dir=%s, config_path=%s, output_dir=%s", data_dir, config_path, output_dir)
 
-    # Step 1: Load config
-    logger.info("Step 1/11: Loading config from %s", config_path)
-    config: Config = load_config(config_path)
-    model_config: ModelConfig = config.model
+    # Load config from path or use provided object
+    if config is not None:
+        logger.info("Step 1/11: Using provided Config object")
+        config_obj: Config = config
+    elif config_path is not None and os.path.isfile(config_path):
+        logger.info("Step 1/11: Loading config from %s", config_path)
+        config_obj = load_config(config_path)
+    else:
+        # Default config if no path provided
+        logger.info("Step 1/11: Using default config")
+        from btc.config import default_config
+        config_obj = default_config()
+    model_config: ModelConfig = config_obj.model
     logger.info(
         "  k=%d, sigma2=%.4f, lambda_smooth=%.2f, lambda_parent=%.1f, alpha=%.3f",
         model_config.k,
-        model_config.reward_config.sigma2,
+        config_obj.model.reward_config.sigma2,
         model_config.lambda_smooth,
         model_config.lambda_parent,
         model_config.alpha,
@@ -1227,7 +1260,7 @@ def run_training_pipeline(
 
     # Step 4: Create chronological splits (TRAIN-06)
     logger.info("Step 4/11: Creating chronological splits (TRAIN-06)")
-    splits = create_chronological_splits(normalized_data, config.timezone)
+    splits = create_chronological_splits(normalized_data, config_obj.timezone)
     split_counts = {purpose: len(records) for purpose, records in splits.items()}
     logger.info("  Split counts: %s", split_counts)
 
@@ -1288,7 +1321,7 @@ def run_training_pipeline(
     logger.info("Step 9/11: Creating PriorBundle (TRAIN-07)")
 
     # Build reward params dict
-    rc = model_config.reward_config
+    rc = config_obj.model.reward_config
     reward_params = {
         "w_meeting": rc.w_meeting,
         "w_answered": rc.w_answered,
@@ -1340,7 +1373,7 @@ def run_training_pipeline(
     bundle_id = generate_bundle_id()
     compatibility_id = generate_compatibility_id(
         k=model_config.k,
-        sigma2=model_config.reward_config.sigma2,
+        sigma2=config_obj.model.reward_config.sigma2,
         reward_params=reward_params,
         state_history_start=model_config.state_history_start,
     )
@@ -1349,16 +1382,20 @@ def run_training_pipeline(
         bundle_id=bundle_id,
         compatibility_id=compatibility_id,
         version="1.0.0",
+        format_version=1,
         created_at=datetime.now(timezone.utc).isoformat(),
         k=model_config.k,
         d=d,
-        sigma2=model_config.reward_config.sigma2,
+        sigma2=config_obj.model.reward_config.sigma2,
         reward_params=reward_params,
         state_history_start=model_config.state_history_start,
         state_history_end=model_config.state_history_end,
         normalization=normalization,
+        feature_ordering=["intercept"] + [f"sin_{i}" for i in range(1, k+1)] + [f"cos_{i}" for i in range(1, k+1)],
         segment_keys=segment_keys,
         global_mu0=global_prior.mu0,
+        global_mean=global_prior.mu0,
+        prior_alpha=model_config.alpha,
         global_sigma0=global_prior.Sigma0,
         global_lambda0=global_prior.Lambda0,
         global_eta0=global_prior.eta0,

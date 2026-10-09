@@ -39,7 +39,7 @@ terminal_retry_dispositions:
 retention_horizon_days: 90
 
 # Model configuration
-model_config:
+model:
   k: 4  # Fourier basis pairs; candidates: 2, 3, 4
   gamma: 1.0  # MUST be 1.0 in release 1; no discounting
   lambda_smooth: 1.0  # Smoothness penalty coefficient
@@ -51,36 +51,9 @@ model_config:
   support_bin_min_sellers: 30  # Minimum distinct sellers per 15-min bin
   state_history_start: "2026-04-01"  # Start of state history interval
   state_history_end: "2026-10-01"  # End of state history interval
-
-# Reward configuration (MOD-01)
-reward_config:
-  w_meeting: 1.0
-  w_answered: 0.1
-  c_dial: 0.02
-  w_not_interested: 0.0
-  sigma2: 1.0  # Working noise variance; floored at 1e-4 (TRAIN-04)
-
-# Database configuration
-database:
-  dsn: "postgresql://btc:btc_dev@localhost:5432/btc_dev"
-  pool_size: 10
-  timeout: 30
-
-# Redis cache (optional)
-redis:
-  enabled: false
-  dsn: "redis://localhost:6379/0"
-  key_prefix: "btc:"
-
-# Authentication (development: hardcoded token; production: environment-injected)
-auth:
-  mode: bearer
-  token: "dev-token-change-me"  # IN production: use env var BTC_AUTH_TOKEN
-
-# Benchmark targets (NFR-05)
-benchmarks:
-  target_recommend_rps: 500
-  target_outcome_rps: 100
-  total_sellers: 150000
-  cold_read_fraction: 0.1
-  hot_seller_fraction: 0.1
+  reward_config:
+    w_meeting: 1.0
+    w_answered: 0.1
+    c_dial: 0.02
+    w_not_interested: 0.0
+    sigma2: 1.0  # Working noise variance; floored at 1e-4 (TRAIN-04)
