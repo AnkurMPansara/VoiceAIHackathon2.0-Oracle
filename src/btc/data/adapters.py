@@ -452,7 +452,10 @@ def load_attempts_csv(
             call_start_time = parse_timestamp(row.get("call_start_time", ""), source_tz)
 
             # finalized_at: when the outcome became available (vendor_response_time or call_start_time)
-            finalized_at = parse_timestamp(row.get("vendor_response_time", ""), source_tz)
+            try:
+                finalized_at = parse_timestamp(row.get("vendor_response_time", ""), source_tz)
+            except ValueError:
+                finalized_at = call_start_time
             if finalized_at is None:
                 finalized_at = call_start_time
 

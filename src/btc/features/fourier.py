@@ -19,7 +19,7 @@ array([1., 0., 1., 0., 1.])
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Union
 
 import numpy as np
@@ -176,6 +176,8 @@ def time_to_hours(timestamp: datetime) -> float:
             "timestamp must be timezone-aware (has tzinfo); "
             "naive datetimes are not permitted"
         )
+
+    timestamp = timestamp.astimezone(timezone(timedelta(hours=5, minutes=30)))
 
     hour = timestamp.hour
     minute = timestamp.minute

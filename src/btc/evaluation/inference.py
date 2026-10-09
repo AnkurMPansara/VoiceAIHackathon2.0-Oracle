@@ -20,6 +20,7 @@ import logging
 import math
 import os
 from typing import Any, Optional
+from datetime import timezone, timedelta
 
 import numpy as np
 
@@ -190,7 +191,34 @@ def _reward_config_from_metadata(metadata: dict) -> RewardConfig:
 
 
 # ── Segment prior lookup ─────────────────────────────────────────────────────
+GLOBAL_SEGMENT_KEY = json.dumps(["global"])  # '["global"]'
 
+
+def _parent_key(key: str) -> Optional[str]:
+    """Derive the parent segment key from the key itself."""
+    try:
+        p = json.loads(key)
+    except (TypeError, ValueError):
+        return GLOBAL_SEGMENT_KEY if key != GLOBAL_SEGMENT_KEY else None
+    if not isinstance(p, list) or not p:
+        return GLOBAL_SEGMENT_KEY
+    if len(p) > 1:
+        return json.dumps(p[:-1])
+    return None if p == ["global"] else GLOBAL_SEGMENT_KEY
+
+
+def _make_global_prior(bundle_arrays: dict, d: int) -> Prior:
+    """Build the bundle's global prior (replaces the zeros/eye fallback)."""
+    try:
+        return _make_raw_prior(
+            bundle_arrays["global_mu0"],
+            bundle_arrays["global_sigma0"],
+            bundle_arrays["global_lambda0"],
+            bundle_arrays["global_eta0"],
+            d,
+        )
+    except KeyError as exc:
+        raise ValueError(f"Bundle is missing global prior array: {exc}") from exc
 
 def _find_segment_prior(
     segment_key: str,
@@ -227,7 +255,6 @@ def _find_segment_prior(
     Prior or None
         The segment prior, or None if no prior found.
     """
-    hierarchy = metadata.get("segment_hierarchy", {})
     d = segment_mu0.shape[1]
 
     def _try_idx(key: str) -> Optional[int]:
@@ -236,28 +263,15 @@ def _find_segment_prior(
                 return i
         return None
 
-    # Try exact match first
-    idx = _try_idx(segment_key)
-    if idx is not None:
-        return _make_raw_prior(
-            segment_mu0[idx], segment_sigma0[idx],
-            segment_lambda0[idx], segment_eta0[idx], d,
-        )
-
-    # Walk up hierarchy
-    current_key = segment_key
-    while True:
-        parent_key = hierarchy.get(current_key)
-        if parent_key is None or parent_key == current_key:
-            break
-        idx = _try_idx(parent_key)
+    key: Optional[str] = segment_key
+    while key is not None:
+        idx = _try_idx(key)
         if idx is not None:
             return _make_raw_prior(
                 segment_mu0[idx], segment_sigma0[idx],
                 segment_lambda0[idx], segment_eta0[idx], d,
             )
-        current_key = parent_key
-
+        key = _parent_key(key)
     return None
 
 
@@ -369,7 +383,8 @@ def _extract_meeting_hours(training_records: list[dict]) -> list[float]:
         if call_start is None:
             continue
         hour = call_start.hour
-        meeting_hours.append(float(hour))
+        _ist_hour = lambda dt: dt.astimezone(timezone(timedelta(hours=5, minutes=30))).hour
+        meeting_hours.append(float(_ist_hour))
     return meeting_hours
 
 
@@ -426,20 +441,35 @@ def _compute_historical_metrics(
 
     result["historical_meeting_hours"] = meeting_hours
 
-    # Compute hour counts and rates
+    # Compute hourly attempts, meetings, and meeting rates
+    hour_attempts: dict[int, int] = {}
     hour_counts: dict[int, int] = {}
-    for h in meeting_hours:
-        hour_int = int(h)
-        hour_counts[hour_int] = hour_counts.get(hour_int, 0) + 1
 
-    total_meetings = len(meeting_hours)
+    for record in training_records:
+        call_start = record.get("call_start_time")
+        if call_start is None:
+            continue
 
-    # Find historical best hour (highest meeting count)
-    best_hour = max(hour_counts, key=hour_counts.get)
-    best_count = hour_counts[best_hour]
+        hour = call_start.astimezone(
+            timezone(timedelta(hours=5, minutes=30))
+        ).hour
+
+        hour_attempts[hour] = hour_attempts.get(hour, 0) + 1
+
+        if record.get("meeting_fixed", False):
+            hour_counts[hour] = hour_counts.get(hour, 0) + 1
+
+    hour_rates = {
+        hour: hour_counts.get(hour, 0) / attempts
+        for hour, attempts in hour_attempts.items()
+        if attempts > 0
+    }
+
+    # Find historical best hour (highest observed meeting rate)
+    best_hour = max(hour_rates, key=hour_rates.get)
     result["historical_best_hour"] = float(best_hour)
     result["historical_best_meeting_rate"] = _ensure_finite_float(
-        best_count / total_meetings
+        hour_rates[best_hour]
     )
 
     # Find historical closest hour to predicted (if prediction exists)
@@ -452,8 +482,8 @@ def _compute_historical_metrics(
         closest_count = hour_counts[closest_hour]
         result["historical_closest_hour"] = float(closest_hour)
         result["historical_closest_meeting_rate"] = _ensure_finite_float(
-            closest_count / total_meetings
-        )
+            hour_rates[int(closest_hour)]
+        ) if int(closest_hour) in hour_rates else None
 
         # Hours from historical best
         result["hours_from_historical_best"] = _ensure_finite_float(
@@ -475,55 +505,16 @@ def _compute_historical_metrics(
 
     # std_dev_from_historical_best: std of all meeting hours around the historical best hour
     # Use circular-aware std: map hours to unit circle, compute std of angular positions
-    if len(meeting_hours) > 0:
-        best_hour_float = float(best_hour)
-        # Convert hours to unit circle coordinates
-        cos_values = np.cos(2 * np.pi * meeting_hours_arr / 24.0)
-        sin_values = np.sin(2 * np.pi * meeting_hours_arr / 24.0)
+    rms = lambda c: float(np.sqrt(np.mean([
+        circular_distance(h, c) ** 2 for h in meeting_hours
+    ])))
 
-        # Mean direction from historical best
-        best_cos = np.cos(2 * np.pi * best_hour_float / 24.0)
-        best_sin = np.sin(2 * np.pi * best_hour_float / 24.0)
-
-        # Compute mean resultant length (R) and mean angle
-        mean_cos = float(np.mean(cos_values))
-        mean_sin = float(np.sin(2 * np.pi * best_hour_float / 24.0))
-
-        # Circular variance: 1 - R where R = sqrt(C^2 + S^2)
-        # But we want std dev, so use sqrt(2 * (1 - R)) for small concentrations
-        R = math.sqrt(mean_cos ** 2 + mean_sin ** 2)
-        R = max(0.0, min(1.0, R))  # Clamp to [0, 1]
-
-        if total_meetings > 1:
-            # Convert circular variance to "std dev" in hours
-            # sigma = sqrt(-2 * ln(R)) * (24 / 2pi) for von Mises approximation
-            if R < 1.0:
-                circular_std = math.sqrt(-2.0 * math.log(R)) * (24.0 / (2.0 * math.pi))
-            else:
-                circular_std = 0.0
-            result["std_dev_from_historical_best"] = _ensure_finite_float(circular_std)
-        else:
-            result["std_dev_from_historical_best"] = 0.0
-
-        # std_dev_from_predicted: std of all meeting hours around predicted hour
-        if predicted_best_hour is not None:
-            pred_cos = float(np.mean(np.cos(2 * np.pi * meeting_hours_arr / 24.0)))
-            pred_sin = float(np.mean(np.sin(2 * np.pi * meeting_hours_arr / 24.0)))
-            R_pred = math.sqrt(pred_cos ** 2 + pred_sin ** 2)
-            R_pred = max(0.0, min(1.0, R_pred))
-
-            if total_meetings > 1:
-                if R_pred < 1.0:
-                    pred_circular_std = math.sqrt(-2.0 * math.log(R_pred)) * (24.0 / (2.0 * math.pi))
-                else:
-                    pred_circular_std = 0.0
-                result["std_dev_from_predicted"] = _ensure_finite_float(pred_circular_std)
-            else:
-                result["std_dev_from_predicted"] = 0.0
-    else:
-        result["std_dev_from_historical_best"] = 0.0
-        if predicted_best_hour is not None:
-            result["std_dev_from_predicted"] = 0.0
+    result["std_dev_from_historical_best"] = rms(float(best_hour))
+    result["std_dev_from_predicted"] = (
+        rms(predicted_best_hour)
+        if predicted_best_hour is not None
+        else None
+    )
 
     return result
 
@@ -578,9 +569,10 @@ def _compute_actual_best_hour(
         if call_start is None:
             continue
         hour = call_start.hour
-        hour_stats[hour]["attempts"] += 1
+        _ist_hour = lambda dt: dt.astimezone(timezone(timedelta(hours=5, minutes=30))).hour
+        hour_stats[_ist_hour]["attempts"] += 1
         if record.get("meeting_fixed", False):
-            hour_stats[hour]["meetings"] += 1
+            hour_stats[_ist_hour]["meetings"] += 1
 
     # Compute meeting rates
     for h in range(24):
@@ -643,10 +635,10 @@ def predict_for_seller(
     segment_eta0 = bundle_arrays.get("segment_eta0")
 
     # Determine seller's segment from test records
-    segment_key = "global"
+    segment_key = GLOBAL_SEGMENT_KEY
     for record in test_records:
-        seg = record.get("segment", "global")
-        if seg != "global":
+        seg = record.get("segment", GLOBAL_SEGMENT_KEY)
+        if seg != GLOBAL_SEGMENT_KEY:
             segment_key = seg
             break
 
@@ -689,9 +681,7 @@ def predict_for_seller(
     )
 
     if segment_prior is None:
-        segment_prior = _make_raw_prior(
-            np.zeros(d), np.eye(d), np.eye(d), np.zeros(d), d,
-        )
+        segment_prior = _make_global_prior(bundle_arrays, d)
 
     # Zero state (cold start)
     state = zero_state(d)
@@ -807,10 +797,10 @@ def predict_for_seller_with_training(
     segment_eta0 = bundle_arrays.get("segment_eta0")
 
     # Determine seller's segment
-    segment_key = "global"
+    segment_key = GLOBAL_SEGMENT_KEY
     for record in test_records + training_records:
-        seg = record.get("segment", "global")
-        if seg != "global":
+        seg = record.get("segment", GLOBAL_SEGMENT_KEY)
+        if seg != GLOBAL_SEGMENT_KEY:
             segment_key = seg
             break
 
@@ -838,9 +828,7 @@ def predict_for_seller_with_training(
     )
 
     if segment_prior is None:
-        segment_prior = _make_raw_prior(
-            np.zeros(d), np.eye(d), np.eye(d), np.zeros(d), d,
-        )
+        segment_prior = _make_global_prior(bundle_arrays, d)
 
     # Compute posterior
     posterior = compute_posterior(state, segment_prior, sigma2)
@@ -1053,7 +1041,6 @@ def generate_inference_report(
     # Step 3: Extract splits
     test_records = splits.get("test", [])
     training_records = (
-        splits.get("prior_fit", []) +
         splits.get("warmup", []) +
         splits.get("validation", [])
     )

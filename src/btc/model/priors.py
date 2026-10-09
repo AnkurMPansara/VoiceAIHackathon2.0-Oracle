@@ -184,7 +184,7 @@ def compute_segment_empirical(
     - n_observations: count of records
     - n_sellers: distinct seller count
     - sum_phi_reward: sum of phi * reward (sufficient statistic for mean)
-    - sum_phi_phi_reward: sum of outer(phi, phi) * reward (for covariance)
+    - sum_phi_phi: sum of outer(phi, phi), the plain Gram matrix (for the ridge fit)
 
     Parameters
     ----------
@@ -236,7 +236,7 @@ def compute_segment_empirical(
                 "n_observations": 0,
                 "sellers": set(),
                 "sum_phi_reward": np.zeros(d, dtype=np.float64),
-                "sum_phi_phi_reward": np.zeros((d, d), dtype=np.float64),
+                "sum_phi_phi": np.zeros((d, d), dtype=np.float64),  
             }
 
         seg = segment_data[segment]
@@ -244,7 +244,7 @@ def compute_segment_empirical(
         if seller_id is not None:
             seg["sellers"].add(seller_id)
         seg["sum_phi_reward"] += phi * reward
-        seg["sum_phi_phi_reward"] += np.outer(phi, phi) * reward
+        seg["sum_phi_phi"] += np.outer(phi, phi)  
 
     # Convert seller sets to counts
     result: dict[str, dict[str, Any]] = {}
@@ -253,7 +253,7 @@ def compute_segment_empirical(
             "n_observations": stats["n_observations"],
             "n_sellers": len(stats["sellers"]),
             "sum_phi_reward": stats["sum_phi_reward"],
-            "sum_phi_phi_reward": stats["sum_phi_phi_reward"],
+            "sum_phi_phi": stats["sum_phi_phi"],  
         }
 
     return result
@@ -306,7 +306,6 @@ def fit_segment_prior(
     n_obs = empirical["n_observations"]
     n_sellers = empirical["n_sellers"]
     sum_phi_reward = empirical["sum_phi_reward"]
-    sum_phi_phi_reward = empirical["sum_phi_phi_reward"]
 
     # Compute empirical covariance
     if n_obs > 1:
@@ -319,21 +318,10 @@ def fit_segment_prior(
         # Sigma = sigma2 * A^{-1}
         # mu = Sigma @ b = A^{-1} @ b
 
-        A = sum_phi_phi_reward / sigma2
-        b = sum_phi_reward / sigma2
-
-        # Check if A is invertible and SPD
-        try:
-            Sigma0 = np.linalg.inv(A) * sigma2
-            if _is_spd(Sigma0):
-                mu0 = Sigma0 @ b
-            else:
-                # Fall back to diagonal prior
-                mu0 = np.zeros(d, dtype=np.float64)
-                Sigma0 = Prior.diagonal_prior(d, alpha=alpha).Sigma0
-        except np.linalg.LinAlgError:
-            mu0 = np.zeros(d, dtype=np.float64)
-            Sigma0 = Prior.diagonal_prior(d, alpha=alpha).Sigma0
+        base = Prior.diagonal_prior(d, alpha=alpha)
+        A = empirical["sum_phi_phi"] / sigma2 + base.Lambda0
+        mu0 = np.linalg.solve(A, empirical["sum_phi_reward"] / sigma2)
+        Sigma0 = base.Sigma0
     else:
         # Not enough data — use diagonal prior
         mu0 = np.zeros(d, dtype=np.float64)
@@ -524,6 +512,7 @@ def fit_hierarchical_priors(
         raise ValueError("No valid data for prior fitting")
 
     # Step 2: Build segment hierarchy
+    global_key = json.dumps(["global"])
     segment_hierarchy: dict[str, Optional[str]] = {}
     for seg_key in empirical:
         try:
@@ -534,14 +523,15 @@ def fit_hierarchical_priors(
         if not isinstance(path, list):
             path = ["UNKNOWN"]
 
-        if len(path) <= 1:
-            # Root segment
+        if seg_key == global_key:
+            # Global is the root: no parent
             segment_hierarchy[seg_key] = None
+        elif len(path) <= 1:
+            # One-level segments hang off the global root
+            segment_hierarchy[seg_key] = global_key
         else:
             # Parent is the prefix of length len-1
-            parent_path = path[:-1]
-            parent_key = json.dumps(parent_path)
-            segment_hierarchy[seg_key] = parent_key
+            segment_hierarchy[seg_key] = json.dumps(path[:-1])
 
     # Step 3: Fit raw priors for each segment
     raw_priors: dict[str, SegmentPrior] = {}
@@ -559,29 +549,22 @@ def fit_hierarchical_priors(
 
     # Step 5: Compute global prior (pooled across all segments)
     total_n = sum(s["n_observations"] for s in empirical.values())
-    total_b = np.zeros(d, dtype=np.float64)
-    total_A = np.zeros((d, d), dtype=np.float64)
 
-    for seg_key, stats in empirical.items():
-        total_b += stats["sum_phi_reward"] / sigma2
-        total_A += stats["sum_phi_phi_reward"] / sigma2
-
-    if total_n > 0:
-        global_Sigma = np.linalg.inv(total_A) * sigma2
-        if _is_spd(global_Sigma):
-            global_mu = global_Sigma @ total_b
-        else:
-            global_mu = np.zeros(d, dtype=np.float64)
-            global_Sigma = Prior.diagonal_prior(d, alpha=alpha).Sigma0
-    else:
-        global_mu = np.zeros(d, dtype=np.float64)
-        global_Sigma = Prior.diagonal_prior(d, alpha=alpha).Sigma0
+    pooled = {
+        "n_observations": total_n,
+        "n_sellers": len(set(r.get("seller_id") for r in data if r.get("seller_id"))),
+        "sum_phi_reward": sum(s["sum_phi_reward"] for s in empirical.values()),
+        "sum_phi_phi": sum(s["sum_phi_phi"] for s in empirical.values()),
+    }
+    _global_fit = fit_segment_prior(pooled, d, sigma2, alpha)
+    global_mu = _global_fit.mu0
+    global_Sigma = _global_fit.Sigma0
 
     global_Lambda = np.linalg.inv(global_Sigma)
     global_eta = global_Lambda @ global_mu
 
     global_prior = SegmentPrior(
-        segment_key=json.dumps(["global"]),
+        segment_key=global_key,
         mu0=global_mu,
         Sigma0=global_Sigma,
         Lambda0=global_Lambda,
@@ -598,13 +581,19 @@ def fit_hierarchical_priors(
     # Step 6: Apply hierarchical shrinkage
     shrunk_priors: dict[str, SegmentPrior] = {}
     for seg_key, prior in raw_priors.items():
-        parent_key = segment_hierarchy.get(seg_key)
-        if parent_key is not None and parent_key in raw_priors:
-            parent_prior = raw_priors[parent_key]
-            shrunk = shrink_to_parent(prior, parent_prior, lambda_parent)
-            shrunk_priors[seg_key] = shrunk
-        else:
+        # The global segment has no parent; never shrink it toward itself
+        if seg_key == global_key:
             shrunk_priors[seg_key] = prior
+            continue
+
+        # Walk up to the nearest ancestor that actually has a raw prior
+        anc = segment_hierarchy.get(seg_key)
+        while anc is not None and anc not in raw_priors:
+            p = json.loads(anc)
+            anc = json.dumps(p[:-1]) if len(p) > 1 else None
+
+        parent_prior = raw_priors[anc] if anc is not None else global_prior
+        shrunk_priors[seg_key] = shrink_to_parent(prior, parent_prior, lambda_parent)
 
     # Update global prior to include all data
     global_prior.n_observations = total_n

@@ -126,6 +126,14 @@ class FallbackResult:
     mu: np.ndarray
     L: np.ndarray
     prior_weight: float = 1.0
+    n: int = 0
+    d: int = 0
+    sigma2: float = 0.0
+
+    @property
+    def is_cold_start(self) -> bool:
+        """Fallback is prior-only, so treat it as cold start."""
+        return True
 
 
 # ── Prior weight ─────────────────────────────────────────────────────────────
@@ -732,4 +740,5 @@ def _make_fallback(
         mu=mu_fallback,
         L=L_fallback,
         prior_weight=1.0,
+        d=prior.d,
     )

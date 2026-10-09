@@ -247,9 +247,7 @@ def _is_in_support_bin(dt: datetime, support_mask: dict) -> bool:
     bool
         True if the hour bin is supported.
     """
-    hour_bin = dt.hour
-    return support_mask.get(hour_bin, False)
-
+    return support_mask.get(f"{dt.hour:02d}:{(dt.minute // 15) * 15:02d}", False)
 
 def _generate_grid(
     earliest: datetime,
@@ -277,7 +275,7 @@ def _generate_grid(
 
     # Align to next quarter-hour if needed
     minute = current.minute
-    if minute % 15 != 0:
+    if current.minute % 15 != 0 or current.second or current.microsecond:
         next_minute = (minute // 15 + 1) * 15
         if next_minute >= 60:
             # Push to next hour

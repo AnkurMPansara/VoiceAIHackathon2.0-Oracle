@@ -55,7 +55,7 @@ _SPLIT_PURPOSES = ["prior_fit", "warmup", "validation", "test"]
 
 
 # ── 15-minute bin helpers ─────────────────────────────────────────────────────
-
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 def _bin_key(dt: datetime) -> str:
     """Compute the 15-minute bin key for a datetime.
@@ -73,9 +73,8 @@ def _bin_key(dt: datetime) -> str:
     str
         Bin key string, e.g. "2026-04-15T10:00".
     """
-    minute = dt.minute
-    floored_minute = (minute // 15) * 15
-    return dt.strftime(f"%Y-%m-%dT%H:{floored_minute:02d}")
+    dt = dt.astimezone(_IST)
+    return f"{dt.hour:02d}:{(dt.minute // 15) * 15:02d}"
 
 
 def _parse_bin_key(key: str) -> datetime:
@@ -546,6 +545,9 @@ def compute_support_bins(
         bin_data[segment][key]["n_attempts"] += 1
         if seller_id is not None:
             bin_data[segment][key]["sellers"].add(seller_id)
+        for seg in (segment, "__all__"):
+            bin_data[seg][key]["n_attempts"] += 1
+            if seller_id is not None: bin_data[seg][key]["sellers"].add(seller_id)
 
     # Build support mask
     result: dict[str, dict[str, bool]] = {}

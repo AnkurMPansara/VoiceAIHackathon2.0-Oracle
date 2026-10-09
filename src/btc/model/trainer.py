@@ -50,6 +50,7 @@ from btc.data.normalization import (
 )
 from btc.features.fourier import feature_dim
 from btc.model.priors import (
+    _is_spd,
     fit_hierarchical_priors,
     HierarchicalPriorResult,
     SegmentPrior,
@@ -57,6 +58,10 @@ from btc.model.priors import (
 from btc.model.stats import Prior
 
 logger = logging.getLogger(__name__)
+
+# Canonical key for the global (root) prior. It has no entry in segment_stats,
+# so it must be exempt from the eligibility filter. Adjust if yours differs.
+GLOBAL_SEGMENT_KEY = "[]"
 
 
 # ---------------------------------------------------------------------------
@@ -575,29 +580,15 @@ def _evaluate_priors_on_data(
     prior_result: HierarchicalPriorResult,
     config: ModelConfig,
 ) -> float:
-    """Evaluate fitted priors on data using log-likelihood proxy.
+    """Evaluate fitted priors on data using mean Gaussian predictive log-likelihood.
 
-    Computes a simple scoring metric based on how well the prior means
-    predict the empirical rewards in the data.
-
-    Parameters
-    ----------
-    data : list[dict]
-        Evaluation data.
-    prior_result : HierarchicalPriorResult
-        Fitted hierarchical priors.
-    config : ModelConfig
-        Model configuration.
-
-    Returns
-    -------
-    float
-        Evaluation score (higher is better).
+    Each record is scored under its own segment prior (falling back to the
+    global prior if the segment has no fitted prior). The predictive variance
+    is sigma2 + phi' Sigma0 phi, so both mu0 and Sigma0 affect the score.
     """
     if not data:
         return 0.0
 
-    d = prior_result.d
     sigma2 = config.reward_config.sigma2
     k = prior_result.k
 
@@ -625,13 +616,15 @@ def _evaluate_priors_on_data(
         hours = time_to_hours(call_start)
         phi = fourier(hours, k=k)
 
-        # Score using global prior mean
-        expected = float(phi @ prior_result.global_prior.mu0)
-        error = reward - expected
-        total_score -= error * error / (2.0 * sigma2)
+        # Use this record's segment prior, falling back to the global prior
+        sp = prior_result.segment_priors.get(
+            record.get("segment"), prior_result.global_prior
+        )
+        s2 = sigma2 + float(phi @ sp.Sigma0 @ phi)
+        error = reward - float(phi @ sp.mu0)
+        total_score += -(error ** 2) / (2.0 * s2) - 0.5 * np.log(s2)
         count += 1
 
-    # Normalize by count
     return total_score / max(count, 1)
 
 
@@ -1036,7 +1029,7 @@ def _verify_checksums(bundle_dir: str, checksums_path: str) -> None:
     for line in lines:
         if ":" not in line:
             continue
-        filename, expected_checksum = line.split(":", 1)
+        filename, expected_checksum = line.split(None, 1)
         filepath = os.path.join(bundle_dir, filename.strip())
 
         if not os.path.isfile(filepath):
@@ -1329,8 +1322,13 @@ def run_training_pipeline(
         "w_not_interested": rc.w_not_interested,
     }
 
-    # Collect segment keys (TRAIN-09: canonical JSON arrays)
+    # Collect segment keys (TRAIN-09: canonical JSON arrays).
+    # TRAIN-01: only eligible segments are stored as real priors; thin
+    # segments fall back to their parent at inference time.
     segment_keys: list[str] = []
+    dropped_thin: list[str] = []
+    missing_stats: list[str] = []
+
     for seg_key in sorted(prior_result.segment_priors.keys()):
         # Validate segment key is a canonical JSON array (TRAIN-09)
         try:
@@ -1339,7 +1337,46 @@ def run_training_pipeline(
                 raise ValueError("Segment key must be a JSON array")
         except (json.JSONDecodeError, TypeError):
             raise ValueError(f"Invalid segment key (TRAIN-09): {seg_key!r}")
-        segment_keys.append(seg_key)
+
+        # The global key is never filtered (it has no segment_stats entry)
+        if seg_key == GLOBAL_SEGMENT_KEY:
+            segment_keys.append(seg_key)
+            continue
+
+        stats = segment_stats.get(seg_key)
+        if stats is None:
+            missing_stats.append(seg_key)
+        elif stats.get("eligible", False):
+            segment_keys.append(seg_key)
+        else:
+            dropped_thin.append(seg_key)
+
+    # Fail loudly on key mismatches instead of silently dropping segments
+    if missing_stats:
+        raise ValueError(
+            f"{len(missing_stats)} fitted segment(s) have no entry in "
+            f"segment_stats (key format mismatch?): {missing_stats[:5]}"
+        )
+    if not segment_keys:
+        raise ValueError("No eligible segments after applying TRAIN-01 thresholds")
+
+    logger.info("  Kept %d eligible segments, dropped %d thin segments",
+                len(segment_keys), len(dropped_thin))
+
+    # Re-point parents to the nearest surviving ancestor
+    kept = set(segment_keys)
+    full_hierarchy = prior_result.segment_hierarchy
+
+    def _nearest_kept_parent(key: str) -> Optional[str]:
+        parent = full_hierarchy.get(key)
+        seen: set[str] = set()
+        while (parent is not None and parent not in kept
+               and parent != GLOBAL_SEGMENT_KEY and parent not in seen):
+            seen.add(parent)
+            parent = full_hierarchy.get(parent)
+        return parent
+
+    segment_hierarchy = {k: _nearest_kept_parent(k) for k in segment_keys}
 
     # Build array data
     n_segments = len(segment_keys)
@@ -1364,7 +1401,7 @@ def run_training_pipeline(
         segment_n_obs[i] = prior.n_observations
         segment_n_sellers[i] = prior.n_sellers
         segment_is_shrunk[i] = 1.0 if prior.is_shrunk else 0.0
-        segment_parent_keys.append(prior.parent_key)
+        segment_parent_keys.append(segment_hierarchy[seg_key]) 
 
     # Build normalization params (simple feature stats from data)
     normalization = _compute_normalization(normalized_data, model_config.k)
@@ -1391,7 +1428,7 @@ def run_training_pipeline(
         state_history_start=model_config.state_history_start,
         state_history_end=model_config.state_history_end,
         normalization=normalization,
-        feature_ordering=["intercept"] + [f"sin_{i}" for i in range(1, k+1)] + [f"cos_{i}" for i in range(1, k+1)],
+        feature_ordering=["intercept"] + [f"sin_{i}" for i in range(1, model_config.k+1)] + [f"cos_{i}" for i in range(1, model_config.k+1)],
         segment_keys=segment_keys,
         global_mu0=global_prior.mu0,
         global_mean=global_prior.mu0,
@@ -1407,7 +1444,7 @@ def run_training_pipeline(
         segment_n_sellers=segment_n_sellers,
         segment_is_shrunk=segment_is_shrunk,
         segment_parent_keys=segment_parent_keys,
-        segment_hierarchy=prior_result.segment_hierarchy,
+        segment_hierarchy=segment_hierarchy,
         data_checksum=data_checksum,
         split_integrity=integrity,
         segment_statistics=segment_stats,
