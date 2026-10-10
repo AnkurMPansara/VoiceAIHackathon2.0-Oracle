@@ -6,3 +6,4 @@ __pycache__/
 # Caching and build artifacts
 *.egg-info/
 **/*.egg-info/
+artifacts/model_bundle/

@@ -22,6 +22,8 @@ IndiaMART outbound calling intelligence system. Recommends optimal future call t
   - [Start API Server](#start-api-server)
   - [API Endpoints](#api-endpoints)
   - [Shadow Mode](#shadow-mode)
+- [Single Seller Inference](#single-seller-inference)
+- [CLI Interface](#cli-interface)
 - [Evaluation](#evaluation)
   - [Predictive Backtest](#predictive-backtest)
   - [One-Step OPE](#one-step-ope)
@@ -55,6 +57,7 @@ The Best Time to Call system learns a time-of-day reward curve from population s
 ```
 best_time_to_call/
   pyproject.toml
+  inference_for_seller.py     # Interactive single-seller inference script
   configs/
     development.yaml          # Dev defaults: shadow mode, 08-18h calendar
     production.example.yaml   # Template for production
@@ -325,6 +328,180 @@ Set `runtime_mode: shadow` in config. To switch to live:
 runtime_mode: live
 experiment_enabled: true
 ```
+
+---
+
+## Single Seller Inference
+
+The `inference_for_seller.py` script provides an interactive way to run the Best Time to Call model for a single seller. It loads CSV data, builds seller state from historical attempts, computes the posterior, and displays candidate call slots with predicted rewards.
+
+### Usage
+
+```bash
+python inference_for_seller.py
+```
+
+The script prompts for:
+1. **Seller GLID** — the seller identifier to analyze
+2. **Current time** — in `YYYY-MM-DD HH:MM` format (defaults to now if left blank)
+
+### What it does
+
+1. **Loads CSV data** — Reads call attempts and seller files from the `data/` directory
+2. **Builds seller state** — Aggregates historical attempts for the seller into sufficient statistics
+3. **Loads model bundle** — Loads trained priors and hyperparameters from `artifacts/model_bundle`
+4. **Computes posterior** — Combines seller state with segment/global priors
+5. **Generates candidate slots** — Creates 15-minute intervals over a 6-hour window from the current time
+6. **Runs inference** — Calls `predict_for_time_slots` to compute expected rewards and uncertainties
+7. **Displays results** — Shows candidate slots with IST timestamps, rewards, and historical attempts within the window
+
+### Requirements
+
+- A trained model bundle must exist at `artifacts/model_bundle`
+- CSV data files must be present in the `data/` directory
+
+If the model bundle is missing, train it first:
+
+```bash
+btc train-priors --config configs/development.yaml --data-dir data/ --output artifacts/model_bundle
+```
+
+### Example Output
+
+```
+======================================================================
+BEST TIME TO CALL - Single Seller Inference
+======================================================================
+Please enter seller glid: 39323
+Enter current time (YYYY-MM-DD HH:MM) [default: now]: 2026-10-10 10:00
+
+Loading data...
+
+======================================================================
+INFERENCE RESULTS
+======================================================================
+Seller ID:          39323
+Current Time:       2026-10-10 10:00:00 IST
+Window:             6.0 hours
+Cold Start:         False
+Prior Weight:       0.8523
+Historical Attempts:7
+In Window:          3
+Historical Meetings:2
+Historical Rate:    0.2857
+
+CANDIDATE SLOTS (15-min intervals):
+----------------------------------------------------------------------
+Time (IST)               Hour     Reward       Latent Std   Pred Std     Supported
+----------------------------------------------------------------------
+2026-10-10 10:00:00 IST  10.00    0.084321     0.123456     0.134567     Yes
+2026-10-10 10:15:00 IST  10.25    0.091234     0.119876     0.131234     Yes
+2026-10-10 10:30:00 IST  10.50    0.102345     0.115432     0.128765     Yes
+...
+----------------------------------------------------------------------
+
+BEST SLOT: 2026-10-10 14:30:00 IST (Hour: 14.50, Reward: 0.125432)
+
+HISTORICAL ATTEMPTS (within 6-hour window):
+----------------------------------------------------------------------
+Call Start (IST)           Hour     Answered   Meeting    Disposition
+----------------------------------------------------------------------
+2026-10-10 10:15:00 IST    10       Yes        Yes        MEETING_FIXED
+2026-10-10 12:30:00 IST    12       Yes        No         INTERESTED
+2026-10-10 14:00:00 IST    14       No         No         NOT_INTERESTED
+----------------------------------------------------------------------
+======================================================================
+```
+
+---
+
+## CLI Interface
+
+The `btc_cli.py` script provides a quick command-line interface for single-seller best time to call inference. It's designed for rapid testing and analysis with minimal setup.
+
+### Usage
+
+```bash
+python btc_cli.py
+```
+
+Or with piped input for automation:
+
+```bash
+echo "39323
+10:00
+16:00" | python btc_cli.py
+```
+
+### Interactive Prompts
+
+The script prompts for:
+1. **Seller GLID** — the seller identifier to analyze
+2. **Start time** — in `HH:MM` 24-hour format (e.g., `10:00`)
+3. **End time** — in `HH:MM` 24-hour format (e.g., `16:00`)
+
+Supports midnight-crossing windows (e.g., `22:00` to `04:00`).
+
+### What it does
+
+1. **Loads seller data** — Fetches seller's recent attempts from CSV (top 10)
+2. **Displays recent attempts** — Shows last 10 calls with outcomes
+3. **Analyzes time window** — Computes 15-minute interval slots between start and end times
+4. **Runs inference** — Computes expected rewards for each slot
+5. **Shows top 10 recommendations** — Sorted by expected reward (best to worst)
+6. **Compares with history** — Shows historical best time in the window
+
+### Output Format
+
+```
+================================================================================
+BEST TIME TO CALL - CLI Interface
+================================================================================
+
+Please enter seller glid: 42689626
+Loading data...
+Found 10 recent attempts for seller 42689626
+
+RECENT ATTEMPTS:
+--------------------------------------------------------------------------------
+Call Start (IST)          Answered   Meeting    Disposition         
+--------------------------------------------------------------------------------
+2026-06-02 16:06          Yes        Yes        MEETING_FIXED       
+2026-06-11 15:52          Yes        Yes        MEETING_FIXED       
+...
+
+Enter start time (HH:MM, 24h format, e.g., 22:20): 14:00
+Enter end time (HH:MM, 24h format, e.g., 6:00): 20:00
+Window: 14:00 to 20:00 (6.0 hours)
+
+================================================================================
+TOP 10 RECOMMENDED SLOTS
+================================================================================
+Rank   Time (IST)                Hour     Reward       Latent Std   Pred Std    
+--------------------------------------------------------------------------------
+1      2026-10-10 20:00:00 IST   20:00    0.395714     0.392804     1.074381    
+2      2026-10-10 19:45:00 IST   19:45    0.382785     0.386036     1.071925    
+...
+--------------------------------------------------------------------------------
+
+RECOMMENDED BEST TIME: 2026-10-10 20:00:00 IST
+  Hour: 20:00
+  Expected Reward: 0.395714
+
+HISTORICAL BEST IN WINDOW: 2026-06-02 16:06:31 IST
+  Hour: 16:06
+  Actual Reward: 1.080000
+
+================================================================================
+Seller: 42689626 | Cold Start: False | Prior Weight: 0.8081
+Window: 14:00 to 20:00 | Slots: 25
+================================================================================
+```
+
+### Requirements
+
+- A trained model bundle must exist at `artifacts/model_bundle`
+- CSV data files must be present in the `data/` directory
 
 ---
 

@@ -4,22 +4,30 @@ Implements SRS MOD-04 / MOD-06 / MOD-07: Gaussian posterior inference,
 expected reward prediction, uncertainty quantification, and candidate
 scoring for per-seller Bayesian linear regression.
 
+IMPORTANT: This is a DETERMINISTIC expected reward maximization model.
+The model computes phi.T @ mu (posterior mean) for scoring. It does NOT
+use Thompson sampling — no posterior sampling is performed. Uncertainty
+(latent_std, predictive_std) is computed but NOT used in the reward score.
+
 Core Bayesian update (MOD-04):
     Lambda = Lambda0 + A
     L = cholesky(Lambda)              # lower triangular
     mu = solve(L.T, solve(L, eta0 + b))
 
 Scoring (MOD-06):
-    expected_reward = phi.T @ mu
+    expected_reward = phi.T @ mu          # deterministic, posterior mean
     latent_std = sqrt(max(0, dot(solve(L, phi), solve(L, phi))))
     predictive_std = sqrt(latent_std**2 + sigma2)
     prior_weight = trace(Lambda0) / trace(Lambda0 + A)
 
+Note: expected_reward uses ONLY the posterior mean (phi.T @ mu).
+Uncertainty values are computed for diagnostics but do not affect ranking.
+
 MOD-06 notes:
     - prior_weight is a basis-dependent diagnostic, not the fraction of
       prediction caused by the prior.
-    - Return finite values in [0, 1]. Cold-start value is 1.
-    - DO NOT clip scores to [0, 1].
+    - prior_weight is in [0, 1]. Cold-start value is 1.
+    - DO NOT clip expected_reward scores to [0, 1].
 
 MOD-07 notes:
     - Failed Cholesky, nonfinite parameters, or incompatible state
@@ -30,7 +38,7 @@ Modules
 -------
 compute_posterior : Compute posterior from state and prior.
 predict_expected_reward : Predict expected reward for a candidate time.
-predict_uncertainty : Predict latent and predictive uncertainty.
+predict_uncertainty : Predict latent and predictive uncertainty (diagnostics only).
 compute_prior_weight : Compute prior weight diagnostic.
 score_candidate : Full score for a single candidate timestamp.
 score_candidates : Score multiple candidates efficiently.
@@ -216,8 +224,11 @@ def compute_posterior(
     L = cholesky(Lambda)
     mu = solve(L.T, solve(L, eta0 + b))
 
-    MOD-07: Cholesky failure, nonfinite parameters, or incompatible state
-    returns FallbackResult instead of raising. Never fabricates uncertainty.
+    Returns Posterior on success, or FallbackResult on failure (MOD-07).
+    The FallbackResult contains prior-based defaults (mu0, L0, prior_weight=1.0).
+
+    This function is part of a deterministic expected reward maximization pipeline.
+    The returned posterior's mean (mu) is used directly for scoring — no sampling.
 
     Parameters
     ----------
@@ -230,8 +241,9 @@ def compute_posterior(
 
     Returns
     -------
-    Posterior or FallbackResult
-        Posterior on success, FallbackResult on failure.
+    Posterior | FallbackResult
+        Posterior on success (contains mu, L, sigma2, prior_weight, n, d),
+        or FallbackResult on failure (contains reason, mu, L, prior_weight=1.0).
 
     Raises
     ------
@@ -378,9 +390,13 @@ def compute_posterior(
 def predict_expected_reward(
     phi: np.ndarray, posterior: Posterior
 ) -> float:
-    """Predict expected reward for a candidate time.
+    """Predict expected reward for a candidate time using posterior mean.
 
     expected_reward = phi.T @ mu
+
+    This uses the POSTERIOR MEAN (NOT Thompson sampling). The model is
+    deterministic — it always returns the same expected reward for the same
+    phi and posterior. No random sampling from the posterior is performed.
 
     MOD-06: Returns raw expected reward (NOT clipped to [0,1],
     NOT a probability). Values can be negative.
@@ -395,7 +411,8 @@ def predict_expected_reward(
     Returns
     -------
     float
-        Expected reward (NOT clipped to [0,1], NOT a probability).
+        Expected reward = phi.T @ mu (NOT clipped to [0,1], NOT a probability).
+        Can be negative. Deterministic — same inputs always produce same output.
 
     Raises
     ------
@@ -441,6 +458,11 @@ def predict_uncertainty(
     predictive_std = sqrt(latent_std^2 + sigma2)
     prior_weight = trace(Lambda0) / trace(Lambda0 + A)
 
+    IMPORTANT: These uncertainty values are computed for diagnostics/monitoring
+    ONLY. They are NOT used in the expected reward score or candidate ranking.
+    The model uses deterministic expected reward maximization (phi.T @ mu),
+    not Thompson sampling or any uncertainty-aware exploration strategy.
+
     Parameters
     ----------
     phi : np.ndarray, shape (d,)
@@ -453,6 +475,7 @@ def predict_uncertainty(
     tuple[float, float, float]
         (latent_std, predictive_std, prior_weight)
         All finite values. prior_weight in [0, 1].
+        These values are NOT used in reward computation or ranking.
 
     Raises
     ------
@@ -532,7 +555,9 @@ def score_candidate(
 ) -> dict:
     """Compute full score for a single candidate timestamp.
 
-    Returns expected reward, uncertainty measures, and metadata.
+    Computes expected_reward using posterior mean (deterministic, NOT Thompson sampling).
+    Uncertainty measures (latent_std, predictive_std) are included for diagnostics only
+    and do not affect the expected_reward value or candidate ranking.
 
     Parameters
     ----------
@@ -551,6 +576,7 @@ def score_candidate(
         {'expected_reward': float, 'latent_std': float,
          'predictive_std': float, 'prior_weight': float,
          'n': int, 'is_fallback': bool, 'fallback_reason': str or None}
+        expected_reward is deterministic (phi.T @ mu), not Thompson sampled.
 
     Examples
     --------
@@ -605,7 +631,11 @@ def score_candidates(
     prior: Prior,
     sigma2: float,
 ) -> np.ndarray:
-    """Score multiple candidates efficiently.
+    """Score multiple candidates efficiently using posterior mean.
+
+    Deterministic expected reward maximization (NOT Thompson sampling).
+    expected_reward = phi @ mu for each candidate, computed in vectorised form.
+    Uncertainty values are diagnostics only, not used in ranking.
 
     Parameters
     ----------
@@ -622,6 +652,7 @@ def score_candidates(
     -------
     np.ndarray, shape (n, 4)
         Columns: [expected_reward, latent_std, predictive_std, prior_weight]
+        expected_reward is deterministic (phi @ mu), not Thompson sampled.
 
     Raises
     ------

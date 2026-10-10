@@ -102,7 +102,8 @@ def normalize_outcome(raw: dict, sellers: dict) -> dict:
 
     SRS DATA-01: All IDs converted to strings (max 128 UTF-8 bytes).
     SRS DATA-02: Timestamps converted to timezone-aware UTC.
-    SRS DATA-04: Cross-field consistency validation.
+    SRS DATA-04: Cross-field consistency validation (validates that related
+                 fields agree with each other).
 
     Processing steps:
     1. Map disposition_label → canonical Disposition enum
@@ -110,8 +111,8 @@ def normalize_outcome(raw: dict, sellers: dict) -> dict:
     3. Convert timestamps to timezone-aware UTC
     4. Convert meeting_fixed (1/0) → bool
     5. Convert call_attempt_count → int
-    6. Resolve seller segment from seller profiles
-    7. Validate cross-field consistency (DATA-04)
+    6. Resolve seller segment from seller profiles (via resolve_segment)
+    7. Validate cross-field consistency (DATA-04) — raises ValueError on failure
     8. Convert IDs to strings (DATA-01)
 
     Parameters
@@ -342,10 +343,11 @@ def create_chronological_splits(
     normalized_data: list[dict],
     timezone: str = "Asia/Kolkata",
 ) -> dict:
-    """TRAIN-06: Split data into disjoint chronological intervals.
+    """TRAIN-06: Split data into 4 disjoint chronological intervals.
 
-    SRS TRAIN-06: Split data into four disjoint intervals based on
-    ``finalized_at`` timestamp (local business time):
+    SRS TRAIN-06: Creates exactly 4 disjoint (non-overlapping) intervals
+    based on ``finalized_at`` timestamp (local business time). Each record
+    is assigned to exactly one split — no record appears in multiple splits.
 
     | Purpose | Interval |
     |---|---|
@@ -354,9 +356,10 @@ def create_chronological_splits(
     | validation | 2026-08-01 to 2026-09-01 |
     | test | 2026-09-01 to 2026-10-01 |
 
-    At each boundary, only outcomes finalized before that instant are
-    included in the earlier interval. Prior-fitting rows are NOT
-    replayed into seller state (no overlap with subsequent splits).
+    Each interval is half-open: [start, end). At each boundary, only outcomes
+    finalized before that instant are included in the earlier interval.
+    Prior-fitting rows are NOT replayed into seller state (no overlap
+    with subsequent splits).
 
     Parameters
     ----------
@@ -432,8 +435,12 @@ def compute_segment_statistics(
     """TRAIN-01: Compute segment eligibility statistics.
 
     SRS TRAIN-01: Segment resolution follows the hierarchy:
-    cell (category_group) → group_turnover (turnover_band) → group
-    (business_type) → global.
+    cell (category_group) → group_turnover (category_group + turnover_band)
+    → group (category_group alone) → global (no dimensions).
+
+    Segments are SHARED across sellers — multiple sellers with the same
+    category_group and turnover_band share one segment. In the production
+    dataset, ~149,363 sellers map to ~497 unique segments.
 
     A segment is eligible when it has:
     - ≥ min_attempts (default 2,000) finalized attempts

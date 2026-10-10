@@ -16,6 +16,10 @@ and natural parameter eta0 = Lambda0 @ mu0, the posterior is
 
 which is computed via Cholesky factorisation for numerical stability.
 
+IMPORTANT: This module provides the sufficient statistics infrastructure for
+a DETERMINISTIC expected reward maximization model (phi.T @ mu). It does NOT
+implement Thompson sampling or any stochastic exploration strategy.
+
 All functions are PURE (no side effects, no global state).
 gamma = 1 is enforced — no discounting, order-independent additions.
 
@@ -26,6 +30,7 @@ compute_contribution : A, b contribution for a single observation.
 apply_contribution : Update seller state with a new observation.
 revoke_contribution : Remove a contribution (revision handling).
 update_revision : Subtract old, add new (atomic revision).
+posterior_params : Compute posterior mean and covariance (deterministic).
 extract_upper_triangle : Extract upper triangle from symmetric matrix.
 reconstruct_symmetric : Reconstruct full symmetric matrix from upper triangle.
 """
@@ -733,7 +738,7 @@ def posterior_params(
     """Compute posterior mean and covariance from state and prior.
 
     MOD-04: Bayesian linear regression posterior for Gaussian likelihood
-    with Gaussian prior.
+    with Gaussian prior. This is a DETERMINISTIC computation — no sampling.
 
     Given:
         w ~ N(mu0, Sigma0)          (prior)
@@ -749,6 +754,9 @@ def posterior_params(
         L = cholesky(Lambda)          (lower triangular)
         mu = L^{-T} @ L^{-1} @ eta
 
+    NOTE: mu is used directly for expected reward computation (phi.T @ mu).
+    Sigma is returned for diagnostics but not used in the deterministic scoring.
+
     Parameters
     ----------
     state : SellerState
@@ -760,8 +768,8 @@ def posterior_params(
     -------
     tuple[np.ndarray, np.ndarray]
         (mu, Sigma)
-        mu: posterior mean, shape (d,)
-        Sigma: posterior covariance, shape (d, d)
+        mu: posterior mean, shape (d,) — used directly for scoring
+        Sigma: posterior covariance, shape (d, d) — diagnostics only
 
     Raises
     ------

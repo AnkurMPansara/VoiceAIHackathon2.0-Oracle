@@ -1,16 +1,25 @@
-"""Inference report generation for the Best Time to Call prediction system.
+"""Best Time to Call inference module.
 
-Loads the trained model bundle from ``artifacts/model_bundle``, processes
-test-split data (Sep-Oct 2026 chronological split), and generates per-seller
-predictions with predicted best hour, secondary hour, expected reward,
-and accuracy metrics comparing predictions against actual call outcomes.
+Provides two tiers of inference functionality:
+
+1. **Pure inference** – ``predict_for_time_slots()`` takes pre-computed inputs
+   (seller state, segment prior, candidate hours, etc.) and returns scored
+   time slots with zero side effects: no file I/O, no printing, no logging.
+   This function is intended to be called from root-level scripts (e.g.
+   ``inference_for_seller.py``) that handle data loading, state construction,
+   and output.
+
+2. **Full pipeline** – ``predict_for_seller()``, ``predict_for_seller_with_training()``,
+   and ``generate_inference_report()`` orchestrate the entire workflow: loading
+   CSV data, building seller states, scoring hours, and computing accuracy /
+   historical comparison metrics.
 
 Modules
 -------
-load_test_data : Load test split data from normalized records.
-load_model_bundle : Load model bundle metadata and arrays.
-predict_for_seller : Generate predictions for a single seller.
-generate_inference_report : Full report generation pipeline.
+predict_for_time_slots : Pure inference – score candidate time slots.
+predict_for_seller : Generate predictions for a single seller (no training data).
+predict_for_seller_with_training : Generate predictions using training data.
+generate_inference_report : Full report generation pipeline (loads CSVs, scores sellers).
 """
 
 from __future__ import annotations
@@ -20,7 +29,7 @@ import logging
 import math
 import os
 from typing import Any, Optional
-from datetime import timezone, timedelta
+from datetime import datetime, timezone, timedelta
 
 import numpy as np
 
@@ -32,7 +41,7 @@ from btc.data.normalization import (
 )
 from btc.features.fourier import fourier, time_to_hours
 from btc.model.bundle import load_bundle
-from btc.model.posterior import compute_posterior, predict_expected_reward
+from btc.model.posterior import compute_posterior, predict_expected_reward, score_candidates
 from btc.model.reward import compute_reward
 from btc.model.stats import Prior, SellerState, zero_state, apply_contribution
 
@@ -382,9 +391,8 @@ def _extract_meeting_hours(training_records: list[dict]) -> list[float]:
         call_start = record.get("call_start_time")
         if call_start is None:
             continue
-        hour = call_start.hour
         _ist_hour = lambda dt: dt.astimezone(timezone(timedelta(hours=5, minutes=30))).hour
-        meeting_hours.append(float(_ist_hour))
+        meeting_hours.append(float(_ist_hour(call_start)))
     return meeting_hours
 
 
@@ -568,11 +576,11 @@ def _compute_actual_best_hour(
         call_start = record.get("call_start_time")
         if call_start is None:
             continue
-        hour = call_start.hour
         _ist_hour = lambda dt: dt.astimezone(timezone(timedelta(hours=5, minutes=30))).hour
-        hour_stats[_ist_hour]["attempts"] += 1
+        hour = _ist_hour(call_start)
+        hour_stats[hour]["attempts"] += 1
         if record.get("meeting_fixed", False):
-            hour_stats[_ist_hour]["meetings"] += 1
+            hour_stats[hour]["meetings"] += 1
 
     # Compute meeting rates
     for h in range(24):
@@ -602,7 +610,11 @@ def predict_for_seller(
     bundle_metadata: dict,
     bundle_arrays: dict,
 ) -> dict:
-    """Generate predictions for a single seller.
+    """Generate predictions for a single seller (cold start / no training data).
+
+    Builds a zero state, selects the segment prior from the bundle, computes
+    the posterior, and scores all 24 hours to find the best and secondary
+    predicted hours.
 
     Parameters
     ----------
@@ -611,9 +623,9 @@ def predict_for_seller(
     test_records : list[dict]
         Test split records for this seller.
     bundle_metadata : dict
-        Bundle metadata.
+        Bundle metadata (includes k, d, sigma2, segment_keys, reward_params).
     bundle_arrays : dict
-        Bundle arrays.
+        Bundle arrays (segment priors, global prior, etc.).
 
     Returns
     -------
@@ -621,7 +633,10 @@ def predict_for_seller(
         Prediction result with keys:
         seller_id, segment_key, n_seller_attempts, n_test_attempts,
         predicted_best_hour, predicted_secondary_hour, expected_reward,
-        prior_weight, test_meeting_rate, and accuracy metrics.
+        prior_weight, test_meeting_rate, test_answer_rate, test_meeting_count,
+        test_total_attempts, predicted_hour_in_support, actual_best_hour,
+        hour_prediction_error, meeting_rate_at_predicted_hour,
+        meeting_rate_at_best_hour.
     """
     k = int(bundle_metadata.get("k", 4))
     d = int(bundle_metadata.get("d", 2 * k + 1))
@@ -766,6 +781,10 @@ def predict_for_seller_with_training(
 ) -> dict:
     """Generate predictions for a single seller using training data.
 
+    Builds the seller state from training records, selects the segment prior,
+    computes the posterior, scores all 24 hours, and computes historical
+    slot comparison metrics.
+
     Parameters
     ----------
     seller_id : str
@@ -775,15 +794,15 @@ def predict_for_seller_with_training(
     training_records : list[dict]
         Training split records (prior_fit + warmup + validation).
     bundle_metadata : dict
-        Bundle metadata.
+        Bundle metadata (includes k, d, sigma2, segment_keys, reward_params).
     bundle_arrays : dict
-        Bundle arrays.
+        Bundle arrays (segment priors, global prior, etc.).
 
     Returns
     -------
     dict
-        Prediction result with full metrics including accuracy and
-        historical slot comparison.
+        Prediction result with full metrics including accuracy, historical
+        slot comparison (historical_best_hour, model_agrees_with_history, etc.).
     """
     k = int(bundle_metadata.get("k", 4))
     d = int(bundle_metadata.get("d", 2 * k + 1))
@@ -917,7 +936,85 @@ def predict_for_seller_with_training(
     }
 
 
-# ── Report generation ────────────────────────────────────────────────────────
+# ── Pure inference for time slots ────────────────────────────────────────────
+
+
+def predict_for_time_slots(
+    candidate_hours: list[float],
+    state: SellerState,
+    segment_prior: Prior,
+    sigma2: float,
+    k: int,
+    support_bins: Optional[dict] = None,
+    segment_key: Optional[str] = None,
+) -> tuple[list[dict], dict]:
+    """Pure inference: score candidate time slots and return the best one.
+
+    This function has **no side effects** — it does not load files, access
+    the filesystem, print, or log. It expects all inputs to be pre-prepared
+    by the caller (typically a root-level script such as ``inference_for_seller.py``
+    that handles CSV loading, state construction, and model bundle loading).
+
+    Parameters
+    ----------
+    candidate_hours : list[float]
+        List of hours (0-23) to score.
+    state : SellerState
+        Seller sufficient statistics (built from training data or zero for cold start).
+    segment_prior : Prior
+        Segment prior for the seller (from bundle or global fallback).
+    sigma2 : float
+        Noise variance (from bundle metadata).
+    k : int
+        Fourier feature dimension parameter (from bundle metadata).
+    support_bins : dict or None
+        Support bins from bundle metadata (optional). Used to mark which
+        hours fall within the seller's supported time range.
+    segment_key : str or None
+        Segment key for support bin lookup (optional).
+
+    Returns
+    -------
+    tuple[list[dict], dict]
+        ``(candidate_slots, best_slot)`` where:
+        - ``candidate_slots``: list of dicts, each with keys
+          ``hour``, ``expected_reward``, ``latent_std``, ``predictive_std``,
+          ``is_supported``.
+        - ``best_slot``: the dict with the highest expected reward, or ``None``
+          if ``candidate_hours`` is empty.
+    """
+    if not candidate_hours:
+        return [], None
+
+    hours_arr = np.array(candidate_hours, dtype=np.float64)
+    phi_matrix = fourier(hours_arr, k=k)
+    scores = score_candidates(phi_matrix, state, segment_prior, sigma2)
+
+    candidate_slots = []
+    for i, hour in enumerate(candidate_hours):
+        expected_reward = float(scores[i, 0])
+        latent_std = float(scores[i, 1])
+        predictive_std = float(scores[i, 2])
+
+        is_supported = False
+        if support_bins and segment_key:
+            is_supported = bool(
+                support_bins.get(segment_key, {}).get(str(hour), False)
+                or support_bins.get("__all__", {}).get(str(hour), False)
+            )
+
+        candidate_slots.append({
+            "hour": round(hour, 2),
+            "expected_reward": round(expected_reward, 6),
+            "latent_std": round(latent_std, 6),
+            "predictive_std": round(predictive_std, 6),
+            "is_supported": is_supported,
+        })
+
+    best_idx = int(np.argmax(scores[:, 0]))
+    best_slot = candidate_slots[best_idx] if candidate_slots else None
+
+    return candidate_slots, best_slot
 
 
 def _compute_hour_distribution_buckets(
@@ -966,25 +1063,29 @@ def generate_inference_report(
     output_path: str,
     n_sellers: int = 100,
 ) -> dict:
-    """Generate inference report for test data.
+    """Generate inference report: full pipeline from CSV loading to JSON output.
+
+    This function orchestrates the entire workflow — loading CSV files,
+    normalizing records, creating chronological splits, loading the model
+    bundle, generating per-seller predictions, and saving the report.
 
     Steps:
-    1. Load normalized data
-    2. Create chronological splits
-    3. Extract test split (Sep-Oct 2026)
-    4. Load model bundle
-    5. For each seller in test data (up to n_sellers):
-       - Get seller's test attempts
+    1. Load and normalize CSV data (attempts + sellers)
+    2. Create chronological splits (prior_fit, warmup, validation, test)
+    3. Extract test split (Sep-Oct 2026) and training data
+    4. Load model bundle (metadata + arrays)
+    5. Group records by seller and sort by priority
+    6. For each seller (up to n_sellers):
        - Build seller state from training data
        - Generate predictions with accuracy metrics
        - Compute historical slot comparison metrics
-    6. Compute summary statistics including accuracy and historical comparison
-    7. Save report to output_path
+    7. Compute summary statistics (accuracy, meeting rate, historical comparison)
+    8. Save report JSON to output_path
 
     Parameters
     ----------
     data_dir : str
-        Directory containing CSV data files.
+        Directory containing CSV data files (attempts and sellers).
     bundle_path : str
         Path to the model bundle directory.
     output_path : str
@@ -995,7 +1096,7 @@ def generate_inference_report(
     Returns
     -------
     dict
-        Inference report with predictions and summary statistics.
+        Inference report with per-seller predictions and summary statistics.
     """
     logger.info("Starting inference report generation")
     logger.info("  data_dir=%s, bundle_path=%s, output_path=%s",

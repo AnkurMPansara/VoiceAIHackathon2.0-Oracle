@@ -4,8 +4,11 @@ Implements SRS MOD-01: utility score computation for finalised call attempts.
 
 This module provides pure functions for computing reward values based on
 outcome labels (answered, meeting_fixed, disposition) and configurable
-weights. The reward is a utility score (not a probability) — values can
-be negative and the constant dial cost does not alter ranking of candidates.
+weights. The reward is a MOD-01 utility score (not a probability) — values
+can be negative and the constant dial cost does not alter ranking of candidates.
+
+Utility score formula:
+    y = w_meeting * meeting_fixed + w_answered * answered - c_dial - w_not_interested * I(NOT_INTERESTED)
 
 DATA-04 cross-field constraints are enforced via ``validate_outcome_consistency``.
 """
@@ -82,14 +85,15 @@ def compute_reward(
     disposition: str,
     reward_config: RewardConfig,
 ) -> float:
-    """Compute the utility reward for a single finalised attempt.
+    """Compute the MOD-01 utility score for a single finalised attempt.
 
-    MOD-01: y = w_meeting * meeting_fixed
-                 + w_answered * answered
-                 - c_dial
-                 - w_not_interested * I(disposition == NOT_INTERESTED)
+    MOD-01 Formula:
+        y = w_meeting * meeting_fixed
+          + w_answered * answered
+          - c_dial
+          - w_not_interested * I(disposition == NOT_INTERESTED)
 
-    This is a utility score (not a probability). Values can be negative.
+    This is a utility score (NOT a probability). Values can be negative.
     The constant -c_dial does not affect ranking of candidate actions.
 
     Parameters
@@ -108,8 +112,8 @@ def compute_reward(
     Returns
     -------
     float
-        Computed reward value (utility score, not probability).
-        Examples with defaults (1.0, 0.1, 0.02, 0.0):
+        MOD-01 utility score (NOT a probability, can be negative).
+        Examples with defaults (w_meeting=1.0, w_answered=0.1, c_dial=0.02, w_not_interested=0.0):
         - Unanswered call: -0.02
         - Answered, no meeting: 0.08
         - Meeting fixed: 1.08

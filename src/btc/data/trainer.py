@@ -8,15 +8,24 @@ The training workflow reads directly from CSV files in the data directory
 (no PostgreSQL required):
 
 1. Discover CSV files (attempts + sellers)
-2. Load and normalize data via btc.data.adapters
-3. Create chronological splits (TRAIN-06)
-4. Fit hierarchical priors (TRAIN-01-05)
-5. Grid search hyperparameters (TRAIN-04)
-6. Create and save model bundle (TRAIN-07)
+2. Load and normalize data via btc.data.adapters (load_attempts_csv, load_sellers_csv)
+3. Join attempts with seller profiles and resolve shared segments
+4. Create 4 disjoint chronological splits (TRAIN-06: prior_fit, warmup, validation, test)
+5. Compute segment statistics (TRAIN-01: ~149k sellers → ~497 shared segments)
+6. Compute 15-minute support bins (TRAIN-05)
+7. Fit hierarchical priors (TRAIN-01-05)
+8. Grid search hyperparameters (TRAIN-04)
+9. Create and save model bundle (TRAIN-07)
+
+Key concepts:
+- Segments are hierarchical (category_group + turnover_band) and SHARED across sellers
+- Sellers do NOT get unique segments; many sellers pool into the same segment
+- Chronological splits are disjoint: each record belongs to exactly one split
 
 Modules
 -------
 train_prior_bundle : Main training entry point from CSV files.
+train_from_csv_paths : Training with explicit file paths.
 discover_csv_files : Find attempts and sellers CSV files in a directory.
 load_and_normalize : Load CSVs and return normalized data (no DB required).
 
@@ -131,6 +140,12 @@ def load_and_normalize(
     and returns normalized records ready for training. No database
     connection is required.
 
+    The normalization pipeline:
+    1. load_attempts_csv() returns (normalized_outcomes, import_report)
+    2. load_sellers_csv() returns dict mapping seller_id -> profile
+    3. join_attempts_sellers() merges attempts with seller profiles
+       and resolves shared segments via resolve_segment()
+
     Parameters
     ----------
     data_dir : str
@@ -142,9 +157,9 @@ def load_and_normalize(
     -------
     tuple[list[dict], dict, dict]
         (normalized_data, attempts_report, sellers_dict)
-        - normalized_data: list of normalized outcome dicts
-        - attempts_report: import report from adapters
-        - sellers_dict: seller_id -> profile mapping
+        - normalized_data: list of normalized outcome dicts (joined with segments)
+        - attempts_report: import report from adapters (counts, exclusions)
+        - sellers_dict: seller_id -> profile mapping (dict, not list)
 
     Raises
     ------
@@ -202,6 +217,10 @@ def train_prior_bundle(
     fits hierarchical priors, and saves a model bundle.
 
     No PostgreSQL database is required — all data is read from CSV files.
+
+    Segments are hierarchical (category_group + turnover_band) and SHARED
+    across sellers. In the production dataset, ~149k sellers map to ~497
+    unique segments (not one segment per seller).
 
     Parameters
     ----------
@@ -287,7 +306,8 @@ def train_from_csv_paths(
     file paths instead of a data directory. This is useful when you
     know the exact file locations or want to use non-standard paths.
 
-    No PostgreSQL database is required.
+    No PostgreSQL database is required. Segments are SHARED across sellers
+    (category_group + turnover_band hierarchy), not unique per seller.
 
     Parameters
     ----------

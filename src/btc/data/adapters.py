@@ -557,6 +557,12 @@ def load_sellers_csv(path: str) -> dict:
 
     Returns dict mapping seller_id (str) -> seller_profile dict.
 
+    The seller_profile dict contains business attributes (category_group,
+    turnover_band, business_type, etc.) that are used by resolve_segment()
+    to compute a shared segment key. Many sellers map to the same segment:
+    in the production dataset, 149,363 sellers are grouped into approximately
+    497 unique segments. Segments are shared — they are NOT unique per seller.
+
     Parameters
     ----------
     path : str
@@ -565,7 +571,8 @@ def load_sellers_csv(path: str) -> dict:
     Returns
     -------
     dict
-        seller_id -> profile mapping.
+        seller_id -> profile mapping. Each profile is a dict with keys such as
+        seller_id, top_category_group, turnover_band, business_type, etc.
     """
     df = pd.read_csv(path, dtype=str, keep_default_na=False)
 
@@ -632,13 +639,23 @@ def load_sellers_csv(path: str) -> dict:
 def resolve_segment(seller_profile: dict) -> str:
     """Resolve seller to segment key for hierarchical pooling.
 
-    Implements TRAIN-01: cell -> group_turnover -> group -> global.
-    Missing dimensions stop at nearest valid parent.
+    Creates hierarchical segments from two dimensions:
+    - **category_group**: top_category_group from seller profile
+    - **turnover_band**: annual_turnover from seller profile
 
     The segment key is a JSON array string representing the hierarchical path:
-    - [cell_value, turnover_band] -> group_turnover segment
-    - [group_value, turnover_band] -> group segment
-    - [global] -> global segment
+    - [category_group, turnover_band] -> group_turnover segment (both present)
+    - [category_group] -> group segment (only category_group present)
+    - ["global", turnover_band] -> turnover segment (only turnover_band present)
+    - ["global"] -> global segment (neither present)
+
+    IMPORTANT: Segments are SHARED across sellers. In the production dataset,
+    149,363 sellers are grouped into approximately 497 unique segments.
+    This is NOT a one-to-one mapping (each seller does NOT get a unique segment).
+    Sellers with the same category_group and turnover_band share the same segment.
+
+    Implements TRAIN-01 hierarchy: cell -> group_turnover -> group -> global.
+    Missing dimensions stop at the nearest valid parent level.
 
     Parameters
     ----------
@@ -648,7 +665,8 @@ def resolve_segment(seller_profile: dict) -> str:
     Returns
     -------
     str
-        Canonical segment key (JSON array string).
+        Canonical segment key (JSON array string). Multiple sellers with the same
+        category_group and turnover_band will receive the identical segment key.
     """
     if not seller_profile:
         return json.dumps(["global"])
